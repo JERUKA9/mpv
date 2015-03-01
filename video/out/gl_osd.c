@@ -55,14 +55,14 @@ static const struct osd_fmt_entry osd_to_gl2_formats[SUBBITMAP_COUNT] = {
 
 struct vertex {
     float position[2];
-    uint8_t color[4];
     float texcoord[2];
+    uint8_t ass_color[4];
 };
 
 static const struct gl_vao_entry vertex_vao[] = {
-    {"vertex_position", 2, GL_FLOAT,         false, offsetof(struct vertex, position)},
-    {"vertex_color",    4, GL_UNSIGNED_BYTE, true,  offsetof(struct vertex, color)},
-    {"vertex_texcoord", 2, GL_FLOAT,         false, offsetof(struct vertex, texcoord)},
+    {"position",    2, GL_FLOAT,         false, offsetof(struct vertex, position)},
+    {"texcoord" ,   2, GL_FLOAT,         false, offsetof(struct vertex, texcoord)},
+    {"ass_color",   2, GL_UNSIGNED_BYTE, true,  offsetof(struct vertex, ass_color)},
     {0}
 };
 
@@ -268,10 +268,10 @@ static void write_quad(struct vertex *va,
                        float tex_w, float tex_h, const uint8_t color[4])
 {
 #define COLOR_INIT {color[0], color[1], color[2], color[3]}
-    va[0] = (struct vertex){ {x0, y0}, COLOR_INIT, {tx0 / tex_w, ty0 / tex_h} };
-    va[1] = (struct vertex){ {x0, y1}, COLOR_INIT, {tx0 / tex_w, ty1 / tex_h} };
-    va[2] = (struct vertex){ {x1, y0}, COLOR_INIT, {tx1 / tex_w, ty0 / tex_h} };
-    va[3] = (struct vertex){ {x1, y1}, COLOR_INIT, {tx1 / tex_w, ty1 / tex_h} };
+    va[0] = (struct vertex){ {x0, y0}, {tx0 / tex_w, ty0 / tex_h}, COLOR_INIT };
+    va[1] = (struct vertex){ {x0, y1}, {tx0 / tex_w, ty1 / tex_h}, COLOR_INIT };
+    va[2] = (struct vertex){ {x1, y0}, {tx1 / tex_w, ty0 / tex_h}, COLOR_INIT };
+    va[3] = (struct vertex){ {x1, y1}, {tx1 / tex_w, ty1 / tex_h}, COLOR_INIT };
     va[4] = va[2];
     va[5] = va[1];
 #undef COLOR_INIT

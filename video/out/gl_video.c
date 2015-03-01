@@ -76,8 +76,8 @@ struct vertex {
 };
 
 static const struct gl_vao_entry vertex_vao[] = {
-    {"vertex_position", 2, GL_FLOAT,         false, offsetof(struct vertex, position)},
-    {"vertex_texcoord", 2, GL_FLOAT,         false, offsetof(struct vertex, texcoord)},
+    {"position", 2, GL_FLOAT, false, offsetof(struct vertex, position)},
+    {"texcoord", 2, GL_FLOAT, false, offsetof(struct vertex, texcoord)},
     {0}
 };
 
@@ -130,6 +130,8 @@ struct gl_video {
 
     int depth_g;
     int texture_16bit_depth;    // actual bits available in 16 bit textures
+
+    struct gl_shader_cache *sc;
 
     GLenum gl_target; // texture target (GL_TEXTURE_2D, ...) for video and FBOs
 
@@ -430,10 +432,11 @@ const struct m_sub_options gl_video_conf = {
 };
 
 static void uninit_rendering(struct gl_video *p);
-static void delete_shaders(struct gl_video *p);
 static void check_gl_features(struct gl_video *p);
 static bool init_format(int fmt, struct gl_video *init);
-static double get_scale_factor(struct gl_video *p);
+
+#define GLSL(x) gl_sc_add(p->sc, #x "\n");
+#define GLSLF(x, ...) gl_sc_addf(p->sc, __VA_ARGS__)
 
 static const struct fmt_entry *find_tex_format(GL *gl, int bytes_per_comp,
                                                int n_channels)
@@ -504,766 +507,6 @@ static void draw_quad(struct gl_video *p,
     gl_vao_draw_data(&p->vao, GL_TRIANGLE_STRIP, va, 4);
 
     debug_check_gl(p, "after rendering");
-}
-
-static void transpose3x3(float r[3][3])
-{
-    MPSWAP(float, r[0][1], r[1][0]);
-    MPSWAP(float, r[0][2], r[2][0]);
-    MPSWAP(float, r[1][2], r[2][1]);
-}
-
-static void update_uniforms(struct gl_video *p, GLuint program)
-{
-    GL *gl = p->gl;
-    GLint loc;
-
-    if (program == 0)
-        return;
-
-    gl->UseProgram(program);
-
-    struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
-    cparams.gray = p->is_yuv && !p->is_packed_yuv && p->plane_count == 1;
-    cparams.input_bits = p->image_desc.component_bits;
-    cparams.texture_bits = (cparams.input_bits + 7) & ~7;
-    mp_csp_set_image_params(&cparams, &p->image_params);
-    mp_csp_copy_equalizer_values(&cparams, &p->video_eq);
-    if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
-        cparams.colorspace = MP_CSP_XYZ;
-        cparams.input_bits = 8;
-        cparams.texture_bits = 8;
-    }
-
-    loc = gl->GetUniformLocation(program, "transform");
-    if (loc >= 0 && p->vp_w > 0 && p->vp_h > 0) {
-        float matrix[3][3];
-        int vvp[2] = {p->vp_h, 0};
-        if (p->vp_vflipped)
-            MPSWAP(int, vvp[0], vvp[1]);
-        gl_matrix_ortho2d(matrix, 0, p->vp_w, vvp[0], vvp[1]);
-        gl->UniformMatrix3fv(loc, 1, GL_FALSE, &matrix[0][0]);
-    }
-
-    loc = gl->GetUniformLocation(program, "colormatrix");
-    if (loc >= 0) {
-        struct mp_cmat m = {{{0}}};
-        if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
-            // Hard-coded as relative colorimetric for now, since this transforms
-            // from the source file's D55 material to whatever color space our
-            // projector/display lives in, which should be D55 for a proper
-            // home cinema setup either way.
-            mp_get_xyz2rgb_coeffs(&cparams, p->csp_src,
-                                  MP_INTENT_RELATIVE_COLORIMETRIC, &m);
-        } else {
-            mp_get_yuv2rgb_coeffs(&cparams, &m);
-        }
-        transpose3x3(m.m); // GLES2 can not transpose in glUniformMatrix3fv
-        gl->UniformMatrix3fv(loc, 1, GL_FALSE, &m.m[0][0]);
-        loc = gl->GetUniformLocation(program, "colormatrix_c");
-        gl->Uniform3f(loc, m.c[0], m.c[1], m.c[2]);
-    }
-
-    gl->Uniform1f(gl->GetUniformLocation(program, "input_gamma"),
-                  p->input_gamma);
-
-    gl->Uniform1f(gl->GetUniformLocation(program, "conv_gamma"),
-                  p->conv_gamma);
-
-    // Coefficients for the sigmoidal transform are taken from the
-    // formula here: http://www.imagemagick.org/Usage/color_mods/#sigmoidal
-    float sig_center = p->opts.sigmoid_center;
-    float sig_slope = p->opts.sigmoid_slope;
-
-    // This function needs to go through (0,0) and (1,1) so we compute the
-    // values at 1 and 0, and then scale/shift them, respectively.
-    float sig_offset = 1.0/(1+expf(sig_slope * sig_center));
-    float sig_scale  = 1.0/(1+expf(sig_slope * (sig_center-1))) - sig_offset;
-
-    gl->Uniform1f(gl->GetUniformLocation(program, "sig_center"), sig_center);
-    gl->Uniform1f(gl->GetUniformLocation(program, "sig_slope"), sig_slope);
-    gl->Uniform1f(gl->GetUniformLocation(program, "sig_scale"), sig_scale);
-    gl->Uniform1f(gl->GetUniformLocation(program, "sig_offset"), sig_offset);
-
-    gl->Uniform1f(gl->GetUniformLocation(program, "inv_gamma"),
-                  1.0f / p->user_gamma);
-
-    for (int n = 0; n < p->plane_count; n++) {
-        char textures_n[32];
-        char textures_size_n[32];
-        snprintf(textures_n, sizeof(textures_n), "texture%d", n);
-        snprintf(textures_size_n, sizeof(textures_size_n), "textures_size[%d]", n);
-
-        gl->Uniform1i(gl->GetUniformLocation(program, textures_n), n);
-        if (p->gl_target == GL_TEXTURE_2D) {
-            gl->Uniform2f(gl->GetUniformLocation(program, textures_size_n),
-                          p->image.planes[n].tex_w, p->image.planes[n].tex_h);
-        } else {
-            // Makes the pixel size calculation code think they are 1x1
-            gl->Uniform2f(gl->GetUniformLocation(program, textures_size_n), 1, 1);
-        }
-    }
-
-    loc = gl->GetUniformLocation(program, "chroma_div");
-    if (loc >= 0) {
-        int xs = p->image_desc.chroma_xs;
-        int ys = p->image_desc.chroma_ys;
-        gl->Uniform2f(loc, 1.0 / (1 << xs), 1.0 / (1 << ys));
-    }
-
-    gl->Uniform2f(gl->GetUniformLocation(program, "chroma_fix"),
-                  p->chroma_fix[0], p->chroma_fix[1]);
-
-    loc = gl->GetUniformLocation(program, "chroma_center_offset");
-    if (loc >= 0) {
-        int chr = p->opts.chroma_location;
-        if (!chr)
-            chr = p->image_params.chroma_location;
-        int cx, cy;
-        mp_get_chroma_location(chr, &cx, &cy);
-        // By default texture coordinates are such that chroma is centered with
-        // any chroma subsampling. If a specific direction is given, make it
-        // so that the luma and chroma sample line up exactly.
-        // For 4:4:4, setting chroma location should have no effect at all.
-        // luma sample size (in chroma coord. space)
-        float ls_w = 1.0 / (1 << p->image_desc.chroma_xs);
-        float ls_h = 1.0 / (1 << p->image_desc.chroma_ys);
-        // move chroma center to luma center (in chroma coord. space)
-        float o_x = ls_w < 1 ? ls_w * -cx / 2 : 0;
-        float o_y = ls_h < 1 ? ls_h * -cy / 2 : 0;
-        int c = p->gl_target == GL_TEXTURE_2D ? 1 : 0;
-        gl->Uniform2f(loc, o_x / FFMAX(p->image.planes[1].w * c, 1),
-                           o_y / FFMAX(p->image.planes[1].h * c, 1));
-    }
-
-    gl->Uniform2f(gl->GetUniformLocation(program, "dither_size"),
-                  p->dither_size, p->dither_size);
-
-    gl->Uniform1i(gl->GetUniformLocation(program, "lut_3d"), TEXUNIT_3DLUT);
-
-    loc = gl->GetUniformLocation(program, "cms_matrix");
-    if (loc >= 0) {
-        float cms_matrix[3][3] = {{0}};
-        // Hard-coded to relative colorimetric - for a BT.2020 3DLUT we expect
-        // the input to be actual BT.2020 and not something red- or blueshifted,
-        // and for sRGB monitors we most likely want relative scaling either way.
-        mp_get_cms_matrix(p->csp_src, p->csp_dest, MP_INTENT_RELATIVE_COLORIMETRIC, cms_matrix);
-        gl->UniformMatrix3fv(loc, 1, GL_TRUE, &cms_matrix[0][0]);
-    }
-
-    for (int n = 0; n < 2; n++) {
-        const char *lut = p->scalers[n].lut_name;
-        if (lut)
-            gl->Uniform1i(gl->GetUniformLocation(program, lut),
-                          TEXUNIT_SCALERS + n);
-    }
-
-    gl->Uniform1i(gl->GetUniformLocation(program, "dither"), TEXUNIT_DITHER);
-    gl->Uniform1f(gl->GetUniformLocation(program, "dither_quantization"),
-                  p->dither_quantization);
-    gl->Uniform1f(gl->GetUniformLocation(program, "dither_center"),
-                  p->dither_center);
-
-    float sparam1_l = p->opts.scaler_params[0][0];
-    float sparam1_c = p->opts.scaler_params[1][0];
-    gl->Uniform1f(gl->GetUniformLocation(program, "filter_param1_l"),
-                  isnan(sparam1_l) ? 0.5f : sparam1_l);
-    gl->Uniform1f(gl->GetUniformLocation(program, "filter_param1_c"),
-                  isnan(sparam1_c) ? 0.5f : sparam1_c);
-
-    gl->Uniform3f(gl->GetUniformLocation(program, "translation"), 0, 0, 0);
-
-    gl->UseProgram(0);
-
-    debug_check_gl(p, "update_uniforms()");
-}
-
-static void update_all_uniforms(struct gl_video *p)
-{
-    for (int n = 0; n < SUBBITMAP_COUNT; n++)
-        update_uniforms(p, p->osd->programs[n]);
-    update_uniforms(p, p->indirect_program);
-    update_uniforms(p, p->scale_sep_program);
-    update_uniforms(p, p->final_program);
-    update_uniforms(p, p->inter_program);
-}
-
-#define SECTION_HEADER "#!section "
-
-static char *get_section(void *talloc_ctx, struct bstr source,
-                         const char *section)
-{
-    char *res = talloc_strdup(talloc_ctx, "");
-    bool copy = false;
-    while (source.len) {
-        struct bstr line = bstr_strip_linebreaks(bstr_getline(source, &source));
-        if (bstr_eatstart(&line, bstr0(SECTION_HEADER))) {
-            copy = bstrcmp0(line, section) == 0;
-        } else if (copy) {
-            res = talloc_asprintf_append_buffer(res, "%.*s\n", BSTR_P(line));
-        }
-    }
-    return res;
-}
-
-static char *t_concat(void *talloc_ctx, const char *s1, const char *s2)
-{
-    return talloc_asprintf(talloc_ctx, "%s%s", s1, s2);
-}
-
-static GLuint create_shader(struct gl_video *p, GLenum type, const char *header,
-                            const char *source)
-{
-    GL *gl = p->gl;
-
-    void *tmp = talloc_new(NULL);
-    const char *full_source = t_concat(tmp, header, source);
-
-    GLuint shader = gl->CreateShader(type);
-    gl->ShaderSource(shader, 1, &full_source, NULL);
-    gl->CompileShader(shader);
-    GLint status;
-    gl->GetShaderiv(shader, GL_COMPILE_STATUS, &status);
-    GLint log_length;
-    gl->GetShaderiv(shader, GL_INFO_LOG_LENGTH, &log_length);
-
-    int pri = status ? (log_length > 1 ? MSGL_V : MSGL_DEBUG) : MSGL_ERR;
-    const char *typestr = type == GL_VERTEX_SHADER ? "vertex" : "fragment";
-    if (mp_msg_test(p->log, pri)) {
-        MP_MSG(p, pri, "%s shader source:\n", typestr);
-        mp_log_source(p->log, pri, full_source);
-    }
-    if (log_length > 1) {
-        GLchar *logstr = talloc_zero_size(tmp, log_length + 1);
-        gl->GetShaderInfoLog(shader, log_length, NULL, logstr);
-        MP_MSG(p, pri, "%s shader compile log (status=%d):\n%s\n",
-               typestr, status, logstr);
-    }
-
-    talloc_free(tmp);
-
-    return shader;
-}
-
-static void prog_create_shader(struct gl_video *p, GLuint program, GLenum type,
-                               const char *header,  const char *source)
-{
-    GL *gl = p->gl;
-    GLuint shader = create_shader(p, type, header, source);
-    gl->AttachShader(program, shader);
-    gl->DeleteShader(shader);
-}
-
-static void link_shader(struct gl_video *p, GLuint program)
-{
-    GL *gl = p->gl;
-    gl->LinkProgram(program);
-    GLint status;
-    gl->GetProgramiv(program, GL_LINK_STATUS, &status);
-    GLint log_length;
-    gl->GetProgramiv(program, GL_INFO_LOG_LENGTH, &log_length);
-
-    int pri = status ? (log_length > 1 ? MSGL_V : MSGL_DEBUG) : MSGL_ERR;
-    if (mp_msg_test(p->log, pri)) {
-        GLchar *logstr = talloc_zero_size(NULL, log_length + 1);
-        gl->GetProgramInfoLog(program, log_length, NULL, logstr);
-        MP_MSG(p, pri, "shader link log (status=%d): %s\n", status, logstr);
-        talloc_free(logstr);
-    }
-}
-
-#define PRELUDE_END "// -- prelude end\n"
-
-static GLuint create_program(struct gl_video *p, const char *name,
-                             const char *header, const char *vertex,
-                             const char *frag, struct gl_vao *vao)
-{
-    GL *gl = p->gl;
-    MP_VERBOSE(p, "compiling shader program '%s', header:\n", name);
-    const char *real_header = strstr(header, PRELUDE_END);
-    real_header = real_header ? real_header + strlen(PRELUDE_END) : header;
-    mp_log_source(p->log, MSGL_V, real_header);
-    GLuint prog = gl->CreateProgram();
-    prog_create_shader(p, prog, GL_VERTEX_SHADER, header, vertex);
-    prog_create_shader(p, prog, GL_FRAGMENT_SHADER, header, frag);
-    gl_vao_bind_attribs(vao, prog);
-    link_shader(p, prog);
-    return prog;
-}
-
-static void shader_def(char **shader, const char *name,
-                       const char *value)
-{
-    *shader = talloc_asprintf_append(*shader, "#define %s %s\n", name, value);
-}
-
-static void shader_def_opt(char **shader, const char *name, bool b)
-{
-    if (b)
-        shader_def(shader, name, "1");
-}
-
-#define APPENDF(s_ptr, ...) \
-    *(s_ptr) = talloc_asprintf_append(*(s_ptr), __VA_ARGS__)
-
-static void shader_setup_scaler(char **shader, struct scaler *scaler, int pass)
-{
-    int unit = scaler->index;
-    const char *target = unit == 0 ? "SAMPLE" : "SAMPLE_C";
-    if (!scaler->kernel) {
-        APPENDF(shader, "#define %s(p0, p1, p2) "
-                "sample_%s(p0, p1, p2, filter_param1_%c)\n",
-                target, scaler->name, "lc"[unit]);
-    } else {
-        int size = scaler->kernel->size;
-        const char *lut_tex = scaler->lut_name;
-        char name[40];
-        snprintf(name, sizeof(name), "sample_scaler%d", unit);
-        APPENDF(shader, "#define DEF_SCALER%d \\\n    ", unit);
-        char lut_fn[40];
-        if (scaler->kernel->polar) {
-            double radius = scaler->kernel->radius;
-            int bound = (int)ceil(radius);
-            // SAMPLE_CONVOLUTION_POLAR_R(NAME, R, LUT, WEIGHTS_FN, ANTIRING)
-            APPENDF(shader, "SAMPLE_CONVOLUTION_POLAR_R(%s, %f, %s, WEIGHTS%d, %f)\n",
-                    name, radius, lut_tex, unit, scaler->antiring);
-
-            // Pre-compute unrolled weights matrix
-            APPENDF(shader, "#define WEIGHTS%d(LUT) \\\n    ", unit);
-            for (int y = 1-bound; y <= bound; y++) {
-                for (int x = 1-bound; x <= bound; x++) {
-                    // Since we can't know the subpixel position in advance,
-                    // assume a worst case scenario.
-                    int yy = y > 0 ? y-1 : y;
-                    int xx = x > 0 ? x-1 : x;
-                    double d = sqrt(xx*xx + yy*yy);
-
-                    if (d < radius - 1) {
-                        // Samples definitely inside the main ring
-                        APPENDF(shader, "SAMPLE_POLAR_%s(LUT, %f, %d, %d) \\\n    ",
-                                // The center 4 coefficients are the primary
-                                // contributors, used to clamp the result for
-                                // anti-ringing
-                                (x >= 0 && y >= 0 && x <= 1 && y <= 1)
-                                  ? "PRIMARY" : "HELPER",
-                                radius, x, y);
-                    } else if (d < radius) {
-                        // Samples on the edge, these are potential values
-                        APPENDF(shader, "SAMPLE_POLAR_POTENTIAL(LUT, %f, %d, %d) \\\n    ",
-                                radius, x, y);
-                    }
-                }
-            }
-            APPENDF(shader, "\n");
-        } else {
-            if (size == 2 || size == 6) {
-                snprintf(lut_fn, sizeof(lut_fn), "weights%d", size);
-            } else {
-                snprintf(lut_fn, sizeof(lut_fn), "weights_scaler%d", unit);
-                APPENDF(shader, "WEIGHTS_N(%s, %d) \\\n    ", lut_fn, size);
-            }
-            if (pass != -1) {
-                // The direction/pass assignment is rather arbitrary, but fixed in
-                // other parts of the code (like FBO setup).
-                const char *direction = pass == 0 ? "0, 1" : "1, 0";
-                // SAMPLE_CONVOLUTION_SEP_N(NAME, DIR, N, LUT, WEIGHTS_FUNC, ANTIRING)
-                APPENDF(shader, "SAMPLE_CONVOLUTION_SEP_N(%s, vec2(%s), %d, %s, %s, %f)\n",
-                        name, direction, size, lut_tex, lut_fn, scaler->antiring);
-            } else {
-                // SAMPLE_CONVOLUTION_N(NAME, N, LUT, WEIGHTS_FUNC)
-                APPENDF(shader, "SAMPLE_CONVOLUTION_N(%s, %d, %s, %s)\n",
-                        name, size, lut_tex, lut_fn);
-            }
-        }
-        APPENDF(shader, "#define %s %s\n", target, name);
-    }
-}
-
-// return false if RGB or 4:4:4 YUV
-static bool input_is_subsampled(struct gl_video *p)
-{
-    for (int i = 0; i < p->plane_count; i++)
-        if (p->image_desc.xs[i] || p->image_desc.ys[i])
-            return true;
-    return false;
-}
-
-static void compile_shaders(struct gl_video *p)
-{
-    GL *gl = p->gl;
-
-    debug_check_gl(p, "before shaders");
-
-    delete_shaders(p);
-
-    void *tmp = talloc_new(NULL);
-
-    struct bstr src = bstr0(vo_opengl_shaders);
-    char *vertex_shader = get_section(tmp, src, "vertex_all");
-    char *shader_prelude = get_section(tmp, src, "prelude");
-    char *s_video = get_section(tmp, src, "frag_video");
-
-    bool rg = gl->mpgl_caps & MPGL_CAP_TEX_RG;
-    bool tex1d = gl->mpgl_caps & MPGL_CAP_1D_TEX;
-    bool tex3d = gl->mpgl_caps & MPGL_CAP_3D_TEX;
-    bool arrays = gl->mpgl_caps & MPGL_CAP_1ST_CLASS_ARRAYS;
-    char *header =
-        talloc_asprintf(tmp, "#version %d%s\n"
-                             "#define HAVE_RG %d\n"
-                             "#define HAVE_1DTEX %d\n"
-                             "#define HAVE_3DTEX %d\n"
-                             "#define HAVE_ARRAYS %d\n"
-                             "%s%s",
-                             gl->glsl_version, gl->es >= 300 ? " es" : "",
-                             rg, tex1d, tex3d, arrays, shader_prelude, PRELUDE_END);
-
-    bool use_cms = p->opts.srgb || p->use_lut_3d;
-    // 3DLUT overrides sRGB
-    bool use_srgb = p->opts.srgb && !p->use_lut_3d;
-
-    float input_gamma = 1.0;
-    float conv_gamma = 1.0;
-
-    bool is_xyz = p->image_desc.flags & MP_IMGFLAG_XYZ;
-    if (is_xyz) {
-        input_gamma *= 2.6;
-        // Note that this results in linear light, so we make sure to enable
-        // use_linear_light for XYZ inputs as well.
-    }
-
-    p->input_gamma = input_gamma;
-    p->conv_gamma = conv_gamma;
-
-    bool use_input_gamma = p->input_gamma != 1.0;
-    bool use_conv_gamma = p->conv_gamma != 1.0;
-    bool use_const_luma = p->image_params.colorspace == MP_CSP_BT_2020_C;
-    enum mp_csp_trc gamma_fun = p->image_params.gamma;
-
-    // If either color correction option (3dlut or srgb) is enabled, or if
-    // sigmoidal upscaling is requested, or if the source is linear XYZ, we
-    // always scale in linear light
-    bool use_linear_light = p->opts.linear_scaling || p->opts.sigmoid_upscaling
-                            || use_cms || is_xyz;
-
-    // The inverse of the above transformation is normally handled by
-    // the CMS cases, but if CMS is disabled we need to go back manually
-    bool use_inv_bt1886 = false;
-    if (use_linear_light && !use_cms) {
-        if (gamma_fun == MP_CSP_TRC_SRGB) {
-            use_srgb = true;
-        } else {
-            use_inv_bt1886 = true;
-        }
-    }
-
-    // Optionally transform to sigmoidal color space if requested.
-    p->sigmoid_enabled = p->opts.sigmoid_upscaling;
-    bool use_sigmoid = p->sigmoid_enabled && p->upscaling;
-
-    // Figure out the right color spaces we need to convert, if any
-    enum mp_csp_prim prim_src = p->image_params.primaries, prim_dest;
-    if (use_cms) {
-        // sRGB mode wants sRGB aka BT.709 primaries, but the 3DLUT is
-        // always built against BT.2020.
-        prim_dest = p->opts.srgb ? MP_CSP_PRIM_BT_709 : MP_CSP_PRIM_BT_2020;
-    } else {
-        // If no CMS is being done we just want to output stuff as-is,
-        // in the native colorspace of the source.
-        prim_dest = prim_src;
-    }
-
-    // XYZ input has no defined input color space, so we can directly convert
-    // it to whatever output space we actually need.
-    if (p->image_desc.flags & MP_IMGFLAG_XYZ)
-        prim_src = prim_dest;
-
-    // Set the colorspace primaries and figure out whether we need to perform
-    // an extra conversion.
-    p->csp_src  = mp_get_csp_primaries(prim_src);
-    p->csp_dest = mp_get_csp_primaries(prim_dest);
-
-    bool use_cms_matrix = prim_src != prim_dest;
-
-    if (p->gl_target == GL_TEXTURE_RECTANGLE) {
-        shader_def(&header, "VIDEO_SAMPLER", "sampler2DRect");
-        shader_def_opt(&header, "USE_RECTANGLE", true);
-    } else {
-        shader_def(&header, "VIDEO_SAMPLER", "sampler2D");
-    }
-
-    // Need to pass alpha through the whole chain. (Not needed for OSD shaders.)
-    if (p->opts.alpha_mode == 1)
-        shader_def_opt(&header, "USE_ALPHA", p->has_alpha);
-
-    char *header_osd = talloc_strdup(tmp, header);
-    shader_def_opt(&header_osd, "USE_OSD_LINEAR_CONV_BT1886",
-                   use_cms && gamma_fun == MP_CSP_TRC_BT_1886);
-    shader_def_opt(&header_osd, "USE_OSD_LINEAR_CONV_SRGB",
-                   use_cms && gamma_fun == MP_CSP_TRC_SRGB);
-    shader_def_opt(&header_osd, "USE_OSD_CMS_MATRIX", use_cms_matrix);
-    shader_def_opt(&header_osd, "USE_OSD_3DLUT", p->use_lut_3d);
-    shader_def_opt(&header_osd, "USE_OSD_SRGB", use_cms && use_srgb);
-
-    for (int n = 0; n < SUBBITMAP_COUNT; n++) {
-        const char *name = osd_shaders[n];
-        if (name) {
-            char *s_osd = get_section(tmp, src, name);
-            p->osd_programs[n] = create_program(p, name, header_osd,
-                                                vertex_shader, s_osd,
-                                                &p->osd->vao);
-        }
-    }
-
-    struct gl_vao *v = &p->vao; // VAO to use to draw primitives
-
-    char *header_conv = talloc_strdup(tmp, "");
-    char *header_final = talloc_strdup(tmp, "");
-    char *header_inter = talloc_strdup(tmp, "");
-    char *header_sep = NULL;
-
-    if (p->image_desc.id == IMGFMT_NV12 || p->image_desc.id == IMGFMT_NV21) {
-        shader_def(&header_conv, "USE_CONV", "CONV_NV12");
-    } else if (p->plane_count > 1) {
-        shader_def(&header_conv, "USE_CONV", "CONV_PLANAR");
-    }
-
-    if (p->color_swizzle[0])
-        shader_def(&header_conv, "USE_COLOR_SWIZZLE", p->color_swizzle);
-    shader_def_opt(&header_conv, "USE_INPUT_GAMMA", use_input_gamma);
-    shader_def_opt(&header_conv, "USE_COLORMATRIX", !p->is_rgb);
-    shader_def_opt(&header_conv, "USE_CONV_GAMMA", use_conv_gamma);
-    shader_def_opt(&header_conv, "USE_CONST_LUMA", use_const_luma);
-    shader_def_opt(&header_conv, "USE_LINEAR_LIGHT_BT1886",
-                   use_linear_light && gamma_fun == MP_CSP_TRC_BT_1886);
-    shader_def_opt(&header_conv, "USE_LINEAR_LIGHT_SRGB",
-                   use_linear_light && gamma_fun == MP_CSP_TRC_SRGB);
-    shader_def_opt(&header_conv, "USE_SIGMOID", use_sigmoid);
-    if (p->opts.alpha_mode > 0 && p->has_alpha && p->plane_count > 3)
-        shader_def(&header_conv, "USE_ALPHA_PLANE", "3");
-    if (p->opts.alpha_mode == 2 && p->has_alpha)
-        shader_def(&header_conv, "USE_ALPHA_BLEND", "1");
-    shader_def_opt(&header_conv, "USE_CHROMA_FIX",
-                   p->chroma_fix[0] != 1.0f || p->chroma_fix[1] != 1.0f);
-
-    shader_def_opt(&header_final, "USE_SIGMOID_INV", use_sigmoid);
-    shader_def_opt(&header_final, "USE_INV_GAMMA", p->user_gamma_enabled);
-    shader_def_opt(&header_final, "USE_CMS_MATRIX", use_cms_matrix);
-    shader_def_opt(&header_final, "USE_3DLUT", p->use_lut_3d);
-    shader_def_opt(&header_final, "USE_SRGB", use_srgb);
-    shader_def_opt(&header_final, "USE_INV_BT1886", use_inv_bt1886);
-    shader_def_opt(&header_final, "USE_DITHER", p->dither_texture != 0);
-    shader_def_opt(&header_final, "USE_TEMPORAL_DITHER", p->opts.temporal_dither);
-
-    if (p->scalers[0].kernel && !p->scalers[0].kernel->polar) {
-        header_sep = talloc_strdup(tmp, "");
-        shader_def_opt(&header_sep, "FIXED_SCALE", true);
-        shader_setup_scaler(&header_sep, &p->scalers[0], 0);
-        shader_setup_scaler(&header_inter, &p->scalers[0], 1);
-    } else {
-        shader_setup_scaler(&header_inter, &p->scalers[0], -1);
-    }
-
-    bool use_interpolation = p->opts.smoothmotion;
-
-    if (use_interpolation) {
-        shader_def_opt(&header_inter, "FIXED_SCALE", true);
-        shader_def_opt(&header_final, "USE_LINEAR_INTERPOLATION", 1);
-    }
-
-    // The indirect pass is used to preprocess the image before scaling.
-    bool use_indirect = false;
-
-    // Don't sample from input video textures before converting the input to
-    // its proper gamma.
-    if (use_input_gamma || use_conv_gamma || use_linear_light || use_const_luma)
-        use_indirect = true;
-
-    // Trivial scalers are implemented directly and efficiently by the GPU.
-    // This only includes bilinear and nearest neighbour in OpenGL, but we
-    // don't support nearest neighbour upsampling.
-    bool trivial_scaling = strcmp(p->scalers[0].name, "bilinear") == 0 &&
-                           strcmp(p->scalers[1].name, "bilinear") == 0;
-
-    // If the video is subsampled, chroma information needs to be pulled up to
-    // the input size before scaling can be done. Even for 4:4:4 or planar RGB
-    // this is also faster because it means the scalers can operate on all
-    // channels simultaneously. This is unnecessary for trivial scaling.
-    if (p->plane_count > 1 && !trivial_scaling)
-        use_indirect = true;
-
-    if (input_is_subsampled(p)) {
-        shader_setup_scaler(&header_conv, &p->scalers[1], -1);
-    } else {
-        // Force using the normal scaler on chroma. If the "indirect" stage is
-        // used, the actual scaling will happen in the next stage.
-        shader_def(&header_conv, "SAMPLE_C",
-                   use_indirect ? "SAMPLE_TRIVIAL" : "SAMPLE");
-    }
-
-    if (use_indirect) {
-        // We don't use filtering for the Y-plane (luma), because it's never
-        // scaled in this scenario.
-        shader_def(&header_conv, "SAMPLE", "SAMPLE_TRIVIAL");
-        shader_def_opt(&header_conv, "FIXED_SCALE", true);
-        header_conv = t_concat(tmp, header, header_conv);
-        p->indirect_program =
-            create_program(p, "indirect", header_conv, vertex_shader, s_video, v);
-    } else if (header_sep) {
-        header_sep = t_concat(tmp, header_sep, header_conv);
-    } else {
-        header_inter = t_concat(tmp, header_inter, header_conv);
-    }
-
-    if (header_sep) {
-        header_sep = t_concat(tmp, header, header_sep);
-        p->scale_sep_program =
-            create_program(p, "scale_sep", header_sep, vertex_shader, s_video, v);
-    }
-
-    if (use_interpolation) {
-        header_inter = t_concat(tmp, header, header_inter);
-        p->inter_program =
-            create_program(p, "inter", header_inter, vertex_shader, s_video, v);
-    } else {
-        header_final = t_concat(tmp, header_final, header_inter);
-    }
-
-    header_final = t_concat(tmp, header, header_final);
-    p->final_program =
-        create_program(p, "final", header_final, vertex_shader, s_video, v);
-
-    debug_check_gl(p, "shader compilation");
-
-    talloc_free(tmp);
-}
-
-static void delete_program(GL *gl, GLuint *prog)
-{
-    gl->DeleteProgram(*prog);
-    *prog = 0;
-}
-
-static void delete_shaders(struct gl_video *p)
-{
-    GL *gl = p->gl;
-
-    for (int n = 0; n < SUBBITMAP_COUNT; n++)
-        delete_program(gl, &p->osd->programs[n]);
-    delete_program(gl, &p->indirect_program);
-    delete_program(gl, &p->scale_sep_program);
-    delete_program(gl, &p->final_program);
-    delete_program(gl, &p->inter_program);
-}
-
-static void get_scale_factors(struct gl_video *p, double xy[2])
-{
-    xy[0] = (p->dst_rect.x1 - p->dst_rect.x0) /
-            (double)(p->src_rect.x1 - p->src_rect.x0);
-    xy[1] = (p->dst_rect.y1 - p->dst_rect.y0) /
-            (double)(p->src_rect.y1 - p->src_rect.y0);
-}
-
-static double get_scale_factor(struct gl_video *p)
-{
-    double xy[2];
-    get_scale_factors(p, xy);
-    return FFMIN(xy[0], xy[1]);
-}
-
-static void update_scale_factor(struct gl_video *p, struct scaler *scaler)
-{
-    double scale = 1.0;
-    double xy[2];
-    get_scale_factors(p, xy);
-    double f = MPMIN(xy[0], xy[1]);
-    if (p->opts.fancy_downscaling && scaler->index == 0 && f < 1.0 &&
-        fabs(xy[0] - f) < 0.01 && fabs(xy[1] - f) < 0.01)
-    {
-        MP_VERBOSE(p, "Using fancy-downscaling (scaler %d).\n", scaler->index);
-        scale = FFMAX(1.0, 1.0 / f);
-    }
-    scaler->insufficient = !mp_init_filter(scaler->kernel, filter_sizes, scale);
-}
-
-static void init_scaler(struct gl_video *p, struct scaler *scaler)
-{
-    GL *gl = p->gl;
-
-    assert(scaler->name);
-
-    scaler->kernel = NULL;
-    scaler->insufficient = false;
-
-    const struct filter_kernel *t_kernel = mp_find_filter_kernel(scaler->name);
-    if (!t_kernel)
-        return;
-
-    scaler->kernel_storage = *t_kernel;
-    scaler->kernel = &scaler->kernel_storage;
-
-    for (int n = 0; n < 2; n++) {
-        if (!isnan(p->opts.scaler_params[scaler->index][n]))
-            scaler->kernel->params[n] = p->opts.scaler_params[scaler->index][n];
-    }
-
-    scaler->antiring = p->opts.scaler_antiring[scaler->index];
-
-    if (scaler->kernel->radius < 0)
-        scaler->kernel->radius = p->opts.scaler_radius[scaler->index];
-
-    update_scale_factor(p, scaler);
-
-    int size = scaler->kernel->size;
-    int elems_per_pixel = 4;
-    if (size == 1) {
-        elems_per_pixel = 1;
-    } else if (size == 2) {
-        elems_per_pixel = 2;
-    } else if (size == 6) {
-        elems_per_pixel = 3;
-    }
-    int width = size / elems_per_pixel;
-    assert(size == width * elems_per_pixel);
-    const struct fmt_entry *fmt = &gl_float16_formats[elems_per_pixel - 1];
-    int target;
-
-    if (scaler->kernel->polar) {
-        target = GL_TEXTURE_1D;
-        scaler->lut_name = scaler->index == 0 ? "lut_1d_l" : "lut_1d_c";
-    } else {
-        target = GL_TEXTURE_2D;
-        scaler->lut_name = scaler->index == 0 ? "lut_2d_l" : "lut_2d_c";
-    }
-
-    gl->ActiveTexture(GL_TEXTURE0 + TEXUNIT_SCALERS + scaler->index);
-
-    if (!scaler->gl_lut)
-        gl->GenTextures(1, &scaler->gl_lut);
-
-    gl->BindTexture(target, scaler->gl_lut);
-
-    float *weights = talloc_array(NULL, float, LOOKUP_TEXTURE_SIZE * size);
-    mp_compute_lut(scaler->kernel, LOOKUP_TEXTURE_SIZE, weights);
-
-    if (target == GL_TEXTURE_1D) {
-        gl->TexImage1D(target, 0, fmt->internal_format, LOOKUP_TEXTURE_SIZE,
-                       0, fmt->format, GL_FLOAT, weights);
-    } else {
-        gl->TexImage2D(target, 0, fmt->internal_format, width, LOOKUP_TEXTURE_SIZE,
-                       0, fmt->format, GL_FLOAT, weights);
-    }
-
-    talloc_free(weights);
-
-    gl->TexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl->TexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    gl->TexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    if (target != GL_TEXTURE_1D)
-        gl->TexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    gl->ActiveTexture(GL_TEXTURE0);
-
-    debug_check_gl(p, "after initializing scaler");
 }
 
 static void init_dither(struct gl_video *p)
@@ -1347,6 +590,21 @@ static void recreate_osd(struct gl_video *p)
     p->osd->use_pbo = p->opts.pbo;
 }
 
+static void get_scale_factors(struct gl_video *p, double xy[2])
+{
+    xy[0] = (p->dst_rect.x1 - p->dst_rect.x0) /
+            (double)(p->src_rect.x1 - p->src_rect.x0);
+    xy[1] = (p->dst_rect.y1 - p->dst_rect.y0) /
+            (double)(p->src_rect.y1 - p->src_rect.y0);
+}
+
+static double get_scale_factor(struct gl_video *p)
+{
+    double xy[2];
+    get_scale_factors(p, xy);
+    return FFMIN(xy[0], xy[1]);
+}
+
 static bool does_resize(struct mp_rect src, struct mp_rect dst)
 {
     return src.x1 - src.x0 != dst.x1 - dst.x0 ||
@@ -1365,23 +623,9 @@ static const char *expected_scaler(struct gl_video *p, int unit)
     return p->opts.scalers[unit];
 }
 
-static void update_settings(struct gl_video *p)
-{
-    struct mp_csp_params params;
-    mp_csp_copy_equalizer_values(&params, &p->video_eq);
-
-    p->user_gamma = params.gamma * p->opts.gamma;
-
-    // Lazy gamma shader initialization (a microoptimization)
-    if (p->user_gamma != 1.0f && !p->user_gamma_enabled) {
-        p->user_gamma_enabled = true;
-        p->need_reinit_rendering = true;
-    }
-}
-
 static void reinit_rendering(struct gl_video *p)
 {
-    GL *gl = p->gl;
+    //GL *gl = p->gl;
 
     MP_VERBOSE(p, "Reinit rendering.\n");
 
@@ -1392,41 +636,14 @@ static void reinit_rendering(struct gl_video *p)
     if (!p->image_params.imgfmt)
         return;
 
-    update_settings(p);
-
-    for (int n = 0; n < 2; n++)
-        p->scalers[n].name = expected_scaler(p, n);
-
     init_dither(p);
 
-    init_scaler(p, &p->scalers[0]);
-    init_scaler(p, &p->scalers[1]);
-
-    compile_shaders(p);
-    update_all_uniforms(p);
-
-    int w = p->image_w;
-    int h = p->image_h;
-
-    // Convolution filters don't need linear sampling, so using nearest is
-    // often faster.
-    GLenum filter = p->scalers[0].kernel ? GL_NEAREST : GL_LINEAR;
-
-    if (p->indirect_program) {
-        fbotex_init(&p->indirect_fbo, gl, p->log, w, h, p->gl_target, filter,
-                    p->opts.fbo_format);
-    }
-
     recreate_osd(p);
-
-    p->need_reinit_rendering = false;
 }
 
 static void uninit_rendering(struct gl_video *p)
 {
     GL *gl = p->gl;
-
-    delete_shaders(p);
 
     for (int n = 0; n < 2; n++) {
         gl->DeleteTextures(1, &p->scalers[n].gl_lut);
@@ -1437,15 +654,6 @@ static void uninit_rendering(struct gl_video *p)
 
     gl->DeleteTextures(1, &p->dither_texture);
     p->dither_texture = 0;
-
-    fbotex_uninit(&p->indirect_fbo);
-
-    for (int i = 0; i < FBOSURFACES_MAX; i++) {
-        fbotex_uninit(&p->surfaces[i].fbotex);
-        p->surfaces[i].valid = false;
-    }
-
-    fbotex_uninit(&p->scale_sep_fbo);
 }
 
 void gl_video_set_lut3d(struct gl_video *p, struct lut3d *lut3d)
@@ -1639,186 +847,134 @@ static void uninit_video(struct gl_video *p)
     p->image_params = p->real_image_params;
 }
 
-static void change_dither_trafo(struct gl_video *p)
+// Render to the given FBO with the currently setup shader.
+// The tmp_fbo is purely used to cache the FBO used for this operation (it
+// will be reallocated if its parameters do not match); to actually control
+// src/dst rectangles, set p->pass_src/p->pass_dst/p->pass_vp.
+static void finish_pass(struct gl_video *p, struct fbotex *tmp_fbo)
 {
-    GL *gl = p->gl;
-    int program = p->final_program;
+    gl_sc_gen_shader_and_reset(p->sc);
 
-    int phase = p->frames_rendered % 8u;
-    float r = phase * (M_PI / 2); // rotate
-    float m = phase < 4 ? 1 : -1; // mirror
 
-    gl->UseProgram(program);
-
-    float matrix[2][2] = {{cos(r),     -sin(r)    },
-                          {sin(r) * m,  cos(r) * m}};
-    gl->UniformMatrix2fv(gl->GetUniformLocation(program, "dither_trafo"),
-                         1, GL_TRUE, &matrix[0][0]);
-
-    gl->UseProgram(0);
 }
 
-struct pass {
-    int num;
-    // Not necessarily a FBO; we just abuse this struct because it's convenient.
-    // It specifies the source texture/sub-rectangle for the next pass.
-    struct fbotex f;
-    // If true, render source (f) to dst, instead of the full dest. fbo viewport
-    bool use_dst;
-    struct mp_rect dst;
-    int flags; // for write_quad
-};
-
-// *chain contains the source, and is overwritten with a copy of the result
-// fbo is used as destination texture/render target.
-static void handle_pass(struct gl_video *p, struct pass *chain,
-                        struct fbotex *fbo, GLuint program)
+// sample from video textures, set "color" variable to yuv value
+// (not sure how exactly this should involve the resamplers)
+static void pass_read_video(struct gl_video *p)
 {
-    GL *gl = p->gl;
+    struct gl_shader_cache *sc = p->sc;
+    //GL *gl = p->gl;
+    struct video_image *vimg = &p->image;
 
-    if (!program)
-        return;
+    GLuint imgtex[4] = {0};
+    set_image_textures(p, vimg, imgtex);
 
-    gl->BindTexture(p->gl_target, chain->f.texture);
-    gl->UseProgram(program);
+    for (int n = 0; n < p->plane_count; n++) {
+        char texture_name[32];
+        char texture_size[32];
+        snprintf(texture_name, sizeof(texture_name), "texture%d", n);
+        snprintf(texture_size, sizeof(texture_size), "texture_size%d", n);
 
-    gl->Viewport(fbo->vp_x, fbo->vp_y, fbo->vp_w, fbo->vp_h);
-    gl->BindFramebuffer(GL_FRAMEBUFFER, fbo->fbo);
-
-    int tex_w = chain->f.tex_w;
-    int tex_h = chain->f.tex_h;
-    struct mp_rect src = {
-        .x0 = chain->f.vp_x,
-        .y0 = chain->f.vp_y,
-        .x1 = chain->f.vp_x + chain->f.vp_w,
-        .y1 = chain->f.vp_y + chain->f.vp_h,
-    };
-
-    struct mp_rect dst = {-1, -1, 1, 1};
-    if (chain->use_dst)
-        dst = chain->dst;
-
-    MP_TRACE(p, "Pass %d: [%d,%d,%d,%d] -> [%d,%d,%d,%d][%d,%d@%dx%d/%dx%d] (%d)\n",
-             chain->num, src.x0, src.y0, src.x1, src.y1,
-             dst.x0, dst.y0, dst.x1, dst.y1,
-             fbo->vp_x, fbo->vp_y, fbo->vp_w, fbo->vp_h,
-             fbo->tex_w, fbo->tex_h, chain->flags);
-
-    draw_quad(p,
-              dst.x0, dst.y0, dst.x1, dst.y1,
-              src.x0, src.y0, src.x1, src.y1,
-              tex_w, tex_h, chain->flags);
-
-    *chain = (struct pass){
-        .num = chain->num + 1,
-        .f = *fbo,
-    };
-}
-
-static size_t fbosurface_next(struct gl_video *p)
-{
-    return (p->surface_idx + 1) % FBOSURFACES_MAX;
-}
-
-// Handle all of the frame passes upto and including upscaling, assuming
-// upscaling is not part of the final pass
-static void gl_video_upscale_frame(struct gl_video *p, struct pass *chain, struct fbotex *inter_fbo)
-{
-    // Order of processing: [indirect -> [scale_sep ->]] inter
-    handle_pass(p, chain, &p->indirect_fbo, p->indirect_program);
-
-    // compensated for optional rotation
-    struct mp_rect src_rect_rot = p->src_rect;
-    if ((p->image_params.rotate % 180) == 90) {
-        MPSWAP(int, src_rect_rot.x0, src_rect_rot.y0);
-        MPSWAP(int, src_rect_rot.x1, src_rect_rot.y1);
-    }
-
-    // Clip to visible height so that separate scaling scales the visible part
-    // only (and the target FBO texture can have a bounded size).
-    // Don't clamp width; too hard to get correct final scaling on l/r borders.
-    chain->f.vp_y = src_rect_rot.y0;
-    chain->f.vp_h = src_rect_rot.y1 - src_rect_rot.y0;
-
-    handle_pass(p, chain, &p->scale_sep_fbo, p->scale_sep_program);
-
-    // For Y direction, use the whole source viewport; it has been fit to the
-    // correct origin/height before.
-    // For X direction, assume the texture wasn't scaled yet, so we can
-    // select the correct portion, which will be scaled to screen.
-    chain->f.vp_x = src_rect_rot.x0;
-    chain->f.vp_w = src_rect_rot.x1 - src_rect_rot.x0;
-
-    if (inter_fbo)
-        handle_pass(p, chain, inter_fbo, p->inter_program);
-}
-
-static double gl_video_interpolate_frame(struct gl_video *p,
-                                       struct pass *chain,
-                                       struct frame_timing *t)
-{
-    GL *gl = p->gl;
-    double inter_coeff = 0.0;
-    int64_t prev_pts = p->surfaces[fbosurface_next(p)].pts;
-
-    // Make sure all surfaces are actually valid, and redraw them manually
-    // if this is not the case
-    for (int i = 0; i < FBOSURFACES_MAX; i++) {
-        if (!p->surfaces[i].valid) {
-            struct pass frame = { .f = chain->f };
-            gl_video_upscale_frame(p, &frame, &p->surfaces[i].fbotex);
-            p->surfaces[i].valid = true;
+        gl_sc_uniform_sampler(sc, texture_name, p->gl_target, n);
+        float f[2] = {1, 1};
+        if (p->gl_target != GL_TEXTURE_RECTANGLE) {
+            f[0] = p->image.planes[n].tex_w;
+            f[1] = p->image.planes[n].tex_h;
         }
+        gl_sc_uniform_vec2(sc, texture_size, f);
     }
 
-    if (t && prev_pts < t->pts) {
-        MP_STATS(p, "new-pts");
-        gl_video_upscale_frame(p, chain, &p->surfaces[p->surface_idx].fbotex);
-        p->surfaces[p->surface_idx].valid = true;
-        p->surfaces[p->surface_idx].pts = t->pts;
-        p->surface_idx = fbosurface_next(p);
+    GLSL(vec2 chr_texcoord = texcoord;)
+
+    if (p->chroma_fix[0] != 1.0f || p->chroma_fix[1] != 1.0f) {
+        // Fix chroma texture coords for 4:2:0 with odd dimensions
+        gl_sc_uniform_vec2(sc, "chroma_fix", p->chroma_fix);
+        GLSL(chr_texcoord = chr_texcoord * chroma_fix;)
+    }
+
+    if (p->gl_target == GL_TEXTURE_RECTANGLE) {
+        int xs = p->image_desc.chroma_xs;
+        int ys = p->image_desc.chroma_ys;
+        float f[2] = {1.0 / (1 << xs), 1.0 / (1 << ys)};
+        gl_sc_uniform_vec2(sc, "chroma_div", f);
+        GLSL(chr_texcoord = chr_texcoord * chroma_div;)
+    }
+
+    int chroma_loc = p->opts.chroma_location;
+    if (!chroma_loc)
+        chroma_loc = p->image_params.chroma_location;
+    if (chroma_loc != MP_CHROMA_CENTER) {
+        int cx, cy;
+        mp_get_chroma_location(chroma_loc, &cx, &cy);
+        // By default texture coordinates are such that chroma is centered with
+        // any chroma subsampling. If a specific direction is given, make it
+        // so that the luma and chroma sample line up exactly.
+        // For 4:4:4, setting chroma location should have no effect at all.
+        // luma sample size (in chroma coord. space)
+        float ls_w = 1.0 / (1 << p->image_desc.chroma_xs);
+        float ls_h = 1.0 / (1 << p->image_desc.chroma_ys);
+        // move chroma center to luma center (in chroma coord. space)
+        float o_x = ls_w < 1 ? ls_w * -cx / 2 : 0;
+        float o_y = ls_h < 1 ? ls_h * -cy / 2 : 0;
+        int c = p->gl_target == GL_TEXTURE_2D ? 1 : 0;
+        float f[2] = {o_x / FFMAX(p->image.planes[1].w * c, 1),
+                      o_y / FFMAX(p->image.planes[1].h * c, 1)};
+        gl_sc_uniform_vec2(sc, "chroma_center_offset", f);
+        GLSL(chr_texcoord = chr_texcoord + chroma_center_offset;)
+    }
+
+    if (p->image_desc.id == IMGFMT_NV12 || p->image_desc.id == IMGFMT_NV21) {
+        GLSL(vec4 color = vec4(texture(texture0, texcoord).r,
+                               texture(texture1, chr_texcoord).RG, 1.0);)
+    } else if (p->plane_count > 1) {
+        GLSL(vec4 color = vec4(texture(texture0, texcoord).r,
+                               texture(texture1, chr_texcoord).r,
+                               texture(texture2, chr_texcoord).r, 1.0);)
+        if (p->opts.alpha_mode == 1 && p->has_alpha)
+            GLSL(color.a = texture(texture3, texcoord).r;);
     } else {
-        // re-use the previously rendered surface as source
-        chain->f = p->surfaces[fbosurface_next(p)].fbotex;
+        GLSL(vec4 color = texture(texture0, texcoord);)
     }
 
-    // fbosurface 0 is bound by handle_pass
-    gl->ActiveTexture(GL_TEXTURE0 + 1);
-    gl->BindTexture(p->gl_target, p->surfaces[p->surface_idx].fbotex.texture);
-    gl->ActiveTexture(GL_TEXTURE0);
+    if (p->color_swizzle[0])
+        GLSLF("color = color.%s;", p->color_swizzle);
+}
 
-    if (!t) {
-        p->is_interpolated = false;
-        return 0.0;
+// yuv conversion, and any other conversions before main up/down-scaling
+static void pass_convert_yuv(struct gl_video *p)
+{
+    struct gl_shader_cache *sc = p->sc;
+
+    // Conversion from Y'CbCr or other spaces to RGB
+    if (!p->is_rgb) {
+        struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
+        cparams.gray = p->is_yuv && !p->is_packed_yuv && p->plane_count == 1;
+        cparams.input_bits = p->image_desc.component_bits;
+        cparams.texture_bits = (cparams.input_bits + 7) & ~7;
+        mp_csp_set_image_params(&cparams, &p->image_params);
+        mp_csp_copy_equalizer_values(&cparams, &p->video_eq);
+        if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
+            cparams.colorspace = MP_CSP_XYZ;
+            cparams.input_bits = 8;
+            cparams.texture_bits = 8;
+        }
+
+        struct mp_cmat m = {{{0}}};
+        if (p->image_desc.flags & MP_IMGFLAG_XYZ) {
+            // Hard-coded as relative colorimetric for now, since this transforms
+            // from the source file's D55 material to whatever color space our
+            // projector/display lives in, which should be D55 for a proper
+            // home cinema setup either way.
+            mp_get_xyz2rgb_coeffs(&cparams, p->csp_src,
+                                    MP_INTENT_RELATIVE_COLORIMETRIC, &m);
+        } else {
+            mp_get_yuv2rgb_coeffs(&cparams, &m);
+        }
+        gl_sc_uniform_mat3(sc, "colormatrix", true, &m.m[0][0]);
+        gl_sc_uniform_vec3(sc, "colormatrix_c", m.c);
+
+        GLSL(color = vec4(mat3(colormatrix) * color.rgb + colormatrix_c, color.a);)
     }
-
-    int64_t vsync_interval = t->next_vsync - t->prev_vsync;
-
-    if (t->pts > t->next_vsync && t->pts < t->next_vsync + vsync_interval) {
-        // current frame overlaps PTS boundary, blend
-        double R = t->pts - t->next_vsync;
-        float ts = p->opts.smoothmotion_threshold;
-        inter_coeff = R / vsync_interval;
-        inter_coeff = inter_coeff < 0.0 + ts ? 0.0 : inter_coeff;
-        inter_coeff = inter_coeff > 1.0 - ts ? 1.0 : inter_coeff;
-        MP_DBG(p, "inter frame ppts: %lld, pts: %lld, "
-               "vsync: %lld, mix: %f\n",
-               (long long)prev_pts, (long long)t->pts,
-               (long long)t->next_vsync, inter_coeff);
-        MP_STATS(p, "frame-mix");
-
-        // the value is scaled to fit in the graph with the completely
-        // unrelated "phase" value (which is stupid)
-        MP_STATS(p, "value-timed %lld %f mix-value",
-                 (long long)t->pts, inter_coeff * 10000);
-    } else if (t->pts > t->next_vsync) {
-        // there's a new frame, but we haven't displayed or blended it yet,
-        // so we still draw the old frame
-        inter_coeff = 1.0;
-    }
-
-    p->is_interpolated = inter_coeff > 0.0;
-    return inter_coeff;
 }
 
 // (fbo==0 makes BindFramebuffer select the screen backbuffer)
@@ -1832,8 +988,8 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
     gl->Viewport(p->vp_x, p->vp_y, p->vp_w, p->vp_h);
 
-    if (p->opts.temporal_dither)
-        change_dither_trafo(p);
+    //if (p->opts.temporal_dither)
+    //    change_dither_trafo(p);
 
     if (p->dst_rect.x0 > p->vp_x || p->dst_rect.y0 > p->vp_y
         || p->dst_rect.x1 < p->vp_x + p->vp_w
@@ -1844,136 +1000,44 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 
     if (!vimg->mpi) {
         gl->Clear(GL_COLOR_BUFFER_BIT);
-        goto draw_osd;
+        //goto draw_osd;
+        return;
     }
 
-    GLuint imgtex[4] = {0};
-    set_image_textures(p, vimg, imgtex);
+    gl_sc_set_vao(p->sc, &p->vao);
 
-    struct pass chain = {
-        .f = {
-            .vp_w = p->image_w,
-            .vp_h = p->image_h,
-            .tex_w = vimg->planes[0].tex_w,
-            .tex_h = vimg->planes[0].tex_h,
-            .texture = imgtex[0],
-        },
+    pass_read_video(p);
+    pass_convert_yuv(p);
+    //new_pass(p, &p->indirect_fbo, );
+
+    gl_sc_gen_shader_and_reset(p->sc);
+
+    gl->Viewport(p->vp_x, p->vp_y, p->vp_w, p->vp_h);
+    //gl->BindFramebuffer(GL_FRAMEBUFFER, fbo->fbo);
+
+    int tex_w = vimg->planes[0].tex_w;
+    int tex_h = vimg->planes[0].tex_h;
+    struct mp_rect src = {
+        .x0 = p->vp_x,
+        .y0 = p->vp_y,
+        .x1 = p->vp_x + p->vp_w,
+        .y1 = p->vp_y + p->vp_h,
     };
 
-    double inter_coeff = 0.0;
-    if (p->opts.smoothmotion) {
-        inter_coeff = gl_video_interpolate_frame(p, &chain, t);
-    } else {
-        gl_video_upscale_frame(p, &chain, NULL);
-    }
+    struct mp_rect dst = {-1, -1, 1, 1};
 
-    struct fbotex screen = {
-        .vp_x = p->vp_x,
-        .vp_y = p->vp_y,
-        .vp_w = p->vp_w,
-        .vp_h = p->vp_h,
-        .fbo = fbo,
-    };
-
-    chain.use_dst = true;
-    chain.dst = p->dst_rect;
-    chain.flags = (p->image_params.rotate % 90 ? 0 : p->image_params.rotate / 90)
-                | (vimg->image_flipped ? 4 : 0);
-
-    gl->UseProgram(p->final_program);
-    GLint loc = gl->GetUniformLocation(p->final_program, "inter_coeff");
-    gl->Uniform1f(loc, inter_coeff);
-    handle_pass(p, &chain, &screen, p->final_program);
+    draw_quad(p,
+              dst.x0, dst.y0, dst.x1, dst.y1,
+              src.x0, src.y0, src.x1, src.y1,
+              tex_w, tex_h, 0/*chain->flags*/);
 
     gl->UseProgram(0);
-
-    unset_image_textures(p);
 
     p->frames_rendered++;
 
     debug_check_gl(p, "after video rendering");
 
-draw_osd:
-    mpgl_osd_draw(p->osd, p->osd_rect, p->osd_pts, p->image_params.stereo_out);
-
     gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-static void update_window_sized_objects(struct gl_video *p)
-{
-    int w = p->dst_rect.x1 - p->dst_rect.x0;
-    int h = p->dst_rect.y1 - p->dst_rect.y0;
-    if ((p->image_params.rotate % 180) == 90)
-        MPSWAP(int, w, h);
-
-    // Round up to an arbitrary alignment to make window resizing or
-    // panscan controls smoother (less texture reallocations).
-    int width  = FFALIGN(w, 256);
-    int height = FFALIGN(h, 256);
-
-    if (p->scale_sep_program) {
-        if (h > p->scale_sep_fbo.tex_h) {
-            fbotex_uninit(&p->scale_sep_fbo);
-            fbotex_init(&p->scale_sep_fbo, p->gl, p->log, p->image_w, height,
-                        p->gl_target, GL_NEAREST, p->opts.fbo_format);
-        }
-        p->scale_sep_fbo.vp_w = p->image_w;
-        p->scale_sep_fbo.vp_h = h;
-    }
-
-    if (p->opts.smoothmotion) {
-        for (int i = 0; i < FBOSURFACES_MAX; i++) {
-            struct fbotex *fbo = &p->surfaces[i].fbotex;
-            if (w > fbo->tex_w || h > fbo->tex_h) {
-                fbotex_uninit(fbo);
-                fbotex_init(fbo, p->gl, p->log, width, height,
-                            p->gl_target, GL_NEAREST, p->opts.fbo_format);
-            }
-            fbo->vp_w = w;
-            fbo->vp_h = h;
-            p->surfaces[i].valid = false;
-        }
-    }
-}
-
-static void check_resize(struct gl_video *p)
-{
-    bool need_scaler_reinit = false;    // filter size change needed
-    bool need_scaler_update = false;    // filter LUT change needed
-    bool too_small = false;
-    for (int n = 0; n < 2; n++) {
-        if (p->scalers[n].kernel) {
-            struct filter_kernel old = *p->scalers[n].kernel;
-            update_scale_factor(p, &p->scalers[n]);
-            struct filter_kernel new = *p->scalers[n].kernel;
-            need_scaler_reinit |= (new.size != old.size);
-            need_scaler_update |= (new.inv_scale != old.inv_scale);
-            too_small |= p->scalers[n].insufficient;
-        }
-    }
-    for (int n = 0; n < 2; n++) {
-        if (strcmp(p->scalers[n].name, expected_scaler(p, n)) != 0)
-            need_scaler_reinit = true;
-    }
-    if (p->upscaling != (get_scale_factor(p) > 1.0)) {
-        p->upscaling = !p->upscaling;
-        // Switching between upscaling and downscaling also requires sigmoid
-        // to be toggled
-        need_scaler_reinit |= p->sigmoid_enabled;
-    }
-    if (need_scaler_reinit) {
-        reinit_rendering(p);
-    } else if (need_scaler_update) {
-        init_scaler(p, &p->scalers[0]);
-        init_scaler(p, &p->scalers[1]);
-    }
-    if (too_small) {
-        MP_WARN(p, "Can't downscale that much, window "
-                   "output may look suboptimal.\n");
-    }
-
-    update_window_sized_objects(p);
-    update_all_uniforms(p);
 }
 
 void gl_video_resize(struct gl_video *p, struct mp_rect *window,
@@ -1991,7 +1055,7 @@ void gl_video_resize(struct gl_video *p, struct mp_rect *window,
 
     p->vp_vflipped = vflip;
 
-    check_resize(p);
+    //check_resize(p);
 }
 
 static bool get_image(struct gl_video *p, struct mp_image *mpi)
@@ -2237,6 +1301,8 @@ void gl_video_uninit(struct gl_video *p)
 
     uninit_video(p);
 
+    gl_sc_destroy(p->sc);
+
     gl_vao_uninit(&p->vao);
 
     gl->DeleteTextures(1, &p->lut_3d_texture);
@@ -2438,7 +1504,7 @@ void gl_video_config(struct gl_video *p, struct mp_image_params *params)
             init_video(p);
     }
 
-    check_resize(p);
+    //check_resize(p);
 }
 
 void gl_video_set_output_depth(struct gl_video *p, int r, int g, int b)
@@ -2467,6 +1533,7 @@ struct gl_video *gl_video_init(GL *gl, struct mp_log *log, struct osd_state *osd
             { .index = 0, .name = "bilinear" },
             { .index = 1, .name = "bilinear" },
         },
+        .sc = gl_sc_create(gl, log),
         .scratch = talloc_zero_array(p, char *, 1),
     };
     gl_video_set_debug(p, true);
@@ -2503,7 +1570,7 @@ void gl_video_set_options(struct gl_video *p, struct gl_video_opts *opts)
 
     check_gl_features(p);
     reinit_rendering(p);
-    check_resize(p);
+    //check_resize(p);
 }
 
 void gl_video_get_colorspace(struct gl_video *p, struct mp_image_params *params)
@@ -2519,14 +1586,6 @@ struct mp_csp_equalizer *gl_video_eq_ptr(struct gl_video *p)
 // Call when the mp_csp_equalizer returned by gl_video_eq_ptr() was changed.
 void gl_video_eq_update(struct gl_video *p)
 {
-    update_settings(p);
-
-    if (p->need_reinit_rendering) {
-        reinit_rendering(p);
-        check_resize(p);
-    } else {
-        update_all_uniforms(p);
-    }
 }
 
 static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
