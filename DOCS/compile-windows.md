@@ -209,3 +209,49 @@ cp lib32/libwaio.a /mingw32/lib
 cp -r include/waio /mingw64/include
 cp lib64/libwaio.a /mingw64/lib
 ```
+Ubuntu :
+Install
+
+    mkdir rpimpv && cd rpimpv
+    wget https://awesome.nwgat.ninja/deb/mpv/mpv_0.20.0_armhf.deb https://awesome.nwgat.ninja/deb/mpv/libass_0.13.3-1_armhf.deb https://awesome.nwgat.ninja/deb/mpv/ffmpeg_3.1.3-1_armhf.deb
+    sudo dpkg -i *.deb
+    sudo apt-get -f install
+    sudo apt-get install libluajit
+    wget https://awesome.nwgat.ninja/deb/mpv/mpv.conf -O $HOME/.config/mpv/mpv.conf
+    sudo wget https://yt-dl.org/downloads/latest/youtube-dl -O /usr/local/bin/youtube-dl
+    sudo chmod a+rx /usr/local/bin/youtube-dl
+
+Play a file
+
+    mpv http://ow.ly/10tB0C (Big Buck Bunny 1080p30)
+    mpv https://www.youtube.com/watch?v=aqz-KE-bpKQ (Big Buck Bunny 1080p30)
+
+mmal error
+
+    sudo su
+    echo "gpu_mem=159" >> /boot/config.txt
+    echo "gpu_mem=256" >> /boot/config.txt (rpi2/rpi3)
+    sudo reboot
+
+you can tweak the settings in mpv config file, if you need to move the window or change resolution of youtube, it currently defaults to 1080p30
+
+    nano $HOME/.config/mpv/mpv.conf
+
+note: it will default to borderless non-movable window, this is a limitation of raspberry pi
+
+Build it yourself
+
+    sudo apt-get install -y gperf bison flex autoconf automake make texinfo help2man libtool libtool-bin ncurses-dev git yasm mercurial cmake cmake-curses-gui libfribidi-dev checkinstall libfontconfig1-dev libgl1-mesa-dev libgles2-mesa-dev gnutls-dev libsmbclient-dev libpulse-dev libbluray-dev libdvdread-dev libluajit-5.1-dev libjpeg-dev libv4l-dev libcdio-cdda-dev libcdio-paranoia-dev
+    git clone https://github.com/mpv-player/mpv-build.git
+    cd mpv-build
+    echo --enable-mmal >> ffmpeg_options
+    ./use-mpv-release
+    ./use-ffmpeg-release
+    ./update
+    ./rebuild -j4
+    sudo ./install
+
+/nwgat 
+
+https://nwgat.ninja/quick-easy-compiling-mpv-for-raspberry-pi/
+
