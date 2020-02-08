@@ -209,7 +209,12 @@ cp lib32/libwaio.a /mingw32/lib
 cp -r include/waio /mingw64/include
 cp lib64/libwaio.a /mingw64/lib
 ```
-Ubuntu :
+Ubuntu
+
+
+
+Easier way to install or build mpv with mmal hardware decoding and ffmpeg/libass
+
 Install
 
     mkdir rpimpv && cd rpimpv
@@ -252,6 +257,3 @@ Build it yourself
     sudo ./install
 
 /nwgat 
-
-https://nwgat.ninja/quick-easy-compiling-mpv-for-raspberry-pi/
-
