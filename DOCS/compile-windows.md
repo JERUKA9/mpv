@@ -257,3 +257,5 @@ Build it yourself
     sudo ./install
 
 /nwgat 
+
+https://nwgat.ninja/quick-easy-compiling-mpv-for-raspberry-pi/
